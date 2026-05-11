@@ -128,6 +128,14 @@ class CudaUtils(object):
         self.fill_tma_descriptor_im2col = mod.fill_tma_descriptor_im2col
         self.launch = mod.launch
         self.build_signature_metadata = mod.build_signature_metadata
+        # Green context APIs (CUDA 12.4+)
+        self.create_green_context = mod.create_green_context
+        self.create_green_context_pair = mod.create_green_context_pair
+        self.destroy_green_context = mod.destroy_green_context
+        self.create_green_ctx_stream = mod.create_green_ctx_stream
+        self.destroy_stream = mod.destroy_stream
+        self.get_green_ctx_sm_count = mod.get_green_ctx_sm_count
+        self.get_device_sm_count = mod.get_device_sm_count
 
 
 # ------------------------

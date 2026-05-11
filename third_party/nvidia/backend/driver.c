@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
@@ -369,6 +370,44 @@ defineGetFunctionHandle(getCuTensorMapEncodeIm2colHandle,
                         cuTensorMapEncodeIm2col);
 
 defineGetFunctionHandle(getLaunchKernelExHandle, cuLaunchKernelEx);
+
+// Green context function pointer typedefs (CUDA 12.4+)
+typedef CUresult (*cuDeviceGetDevResource_t)(
+    CUdevice dev, CUdevResource *result, CUdevResourceType type);
+typedef CUresult (*cuDevSmResourceSplitByCount_t)(
+    CUdevResource *result, unsigned int *nbGroups,
+    const CUdevResource *input, CUdevResource *remaining,
+    unsigned int useFlags, unsigned int minCount);
+typedef CUresult (*cuDevResourceGenerateDesc_t)(
+    CUdevResourceDesc *phDesc, CUdevResource *resources,
+    unsigned int nbResources);
+typedef CUresult (*cuGreenCtxCreate_t)(CUgreenCtx *phCtx,
+                                        CUdevResourceDesc desc, CUdevice dev,
+                                        unsigned int flags);
+typedef CUresult (*cuGreenCtxDestroy_t)(CUgreenCtx hCtx);
+typedef CUresult (*cuCtxFromGreenCtx_t)(CUcontext *pContext,
+                                         CUgreenCtx hCtx);
+typedef CUresult (*cuGreenCtxStreamCreate_t)(CUstream *phStream,
+                                              CUgreenCtx greenCtx,
+                                              unsigned int flags, int priority);
+typedef CUresult (*cuGreenCtxGetDevResource_t)(CUgreenCtx hCtx,
+                                                CUdevResource *resource,
+                                                CUdevResourceType type);
+
+defineGetFunctionHandle(getDeviceGetDevResourceHandle, cuDeviceGetDevResource);
+defineGetFunctionHandle(getDevSmResourceSplitByCountHandle,
+                        cuDevSmResourceSplitByCount);
+defineGetFunctionHandle(getDevResourceGenerateDescHandle,
+                        cuDevResourceGenerateDesc);
+defineGetFunctionHandle(getGreenCtxCreateHandle, cuGreenCtxCreate);
+defineGetFunctionHandle(getGreenCtxDestroyHandle, cuGreenCtxDestroy);
+defineGetFunctionHandle(getCtxFromGreenCtxHandle, cuCtxFromGreenCtx);
+defineGetFunctionHandle(getGreenCtxStreamCreateHandle, cuGreenCtxStreamCreate);
+defineGetFunctionHandle(getGreenCtxGetDevResourceHandle,
+                        cuGreenCtxGetDevResource);
+
+typedef CUresult (*cuStreamDestroy_t)(CUstream hStream);
+defineGetFunctionHandle(getStreamDestroyHandle, cuStreamDestroy);
 
 static PyObject *occupancyMaxActiveClusters(PyObject *self, PyObject *args) {
   int clusterDim = -1, maxActiveClusters = -1;
@@ -1478,6 +1517,280 @@ cleanup:
   return NULL;
 }
 
+// ---------------------------------------------------------------------------
+// Green Context support (CUDA 12.4+)
+// ---------------------------------------------------------------------------
+
+// File-scope function pointers for green context APIs (shared across all
+// green context functions to avoid per-function duplication).
+static cuDeviceGetDevResource_t cuDeviceGetDevResourceFn = NULL;
+static cuDevSmResourceSplitByCount_t cuDevSmResourceSplitByCountFn = NULL;
+static cuDevResourceGenerateDesc_t cuDevResourceGenerateDescFn = NULL;
+static cuGreenCtxCreate_t cuGreenCtxCreateFn = NULL;
+static cuGreenCtxDestroy_t cuGreenCtxDestroyFn = NULL;
+static cuCtxFromGreenCtx_t cuCtxFromGreenCtxFn = NULL;
+static cuGreenCtxStreamCreate_t cuGreenCtxStreamCreateFn = NULL;
+static cuGreenCtxGetDevResource_t cuGreenCtxGetDevResourceFn = NULL;
+static cuStreamDestroy_t cuStreamDestroyFn = NULL;
+
+// Initialize all green context function pointers. Returns false on failure.
+static bool ensureGreenCtxFunctionPointers(void) {
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuDeviceGetDevResourceFn,
+                                      getDeviceGetDevResourceHandle);
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuDevSmResourceSplitByCountFn,
+                                      getDevSmResourceSplitByCountHandle);
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuDevResourceGenerateDescFn,
+                                      getDevResourceGenerateDescHandle);
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuGreenCtxCreateFn,
+                                      getGreenCtxCreateHandle);
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuGreenCtxDestroyFn,
+                                      getGreenCtxDestroyHandle);
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuCtxFromGreenCtxFn,
+                                      getCtxFromGreenCtxHandle);
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuGreenCtxStreamCreateFn,
+                                      getGreenCtxStreamCreateHandle);
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuGreenCtxGetDevResourceFn,
+                                      getGreenCtxGetDevResourceHandle);
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuStreamDestroyFn,
+                                      getStreamDestroyHandle);
+  return true;
+cleanup:
+  return false;
+}
+
+// createGreenContext(device_id, num_sms) -> (green_ctx_handle, cuda_ctx_handle)
+static PyObject *createGreenContext(PyObject *self, PyObject *args) {
+  int device_id;
+  unsigned int num_sms;
+  CUdevice device;
+  CUdevResource totalSmResource;
+  CUdevResource splitResult;
+  CUdevResource remaining;
+  unsigned int nbGroups = 1;
+  CUdevResourceDesc resDesc = NULL;
+  CUgreenCtx greenCtx = NULL;
+  CUcontext cudaCtx = NULL;
+
+  if (!PyArg_ParseTuple(args, "iI", &device_id, &num_sms))
+    return NULL;
+
+  CUDA_CHECK_AND_RETURN_NULL(cuDeviceGet(&device, device_id));
+  if (!ensureGreenCtxFunctionPointers())
+    goto cleanup;
+
+  // Get total SM resources for the device
+  memset(&totalSmResource, 0, sizeof(totalSmResource));
+  CUDA_CHECK_AND_RETURN_NULL(cuDeviceGetDevResourceFn(
+      device, &totalSmResource, CU_DEV_RESOURCE_TYPE_SM));
+
+  // Split SM resources by count
+  memset(&splitResult, 0, sizeof(splitResult));
+  memset(&remaining, 0, sizeof(remaining));
+  CUDA_CHECK_AND_RETURN_NULL(cuDevSmResourceSplitByCountFn(
+      &splitResult, &nbGroups, &totalSmResource, &remaining,
+      CU_DEV_SM_RESOURCE_SPLIT_IGNORE_SM_COSCHEDULING, num_sms));
+
+  // Generate resource descriptor
+  CUDA_CHECK_AND_RETURN_NULL(
+      cuDevResourceGenerateDescFn(&resDesc, &splitResult, 1));
+
+  // Create green context
+  CUDA_CHECK_AND_RETURN_NULL(cuGreenCtxCreateFn(
+      &greenCtx, resDesc, device, CU_GREEN_CTX_DEFAULT_STREAM));
+
+  // Get a CUcontext from the green context
+  CUDA_CHECK_AND_RETURN_NULL(cuCtxFromGreenCtxFn(&cudaCtx, greenCtx));
+
+  return Py_BuildValue("(KK)", (uint64_t)greenCtx, (uint64_t)cudaCtx);
+
+cleanup:
+  if (greenCtx)
+    cuGreenCtxDestroyFn(greenCtx);
+  return NULL;
+}
+
+// createGreenContextPair(device_id, num_sms_each)
+//   -> (green_ctx1, cuda_ctx1, green_ctx2, cuda_ctx2)
+// Creates two green contexts with NON-OVERLAPPING SM partitions by
+// splitting the total SM resource into 2 equal groups in a SINGLE call
+// to cuDevSmResourceSplitByCount (nbGroups=2, result is a 2-element array).
+// Both partitions get exactly num_sms_each SMs (subject to HW rounding).
+static PyObject *createGreenContextPair(PyObject *self, PyObject *args) {
+  // All declarations at top to avoid goto past initializers.
+  int device_id;
+  unsigned int num_sms_each;
+  CUdevice device;
+  CUdevResource totalSmResource;
+  CUdevResource splits[2];
+  CUdevResource remaining;
+  unsigned int nbGroups = 2;
+  CUdevResourceDesc resDesc1 = NULL;
+  CUdevResourceDesc resDesc2 = NULL;
+  CUgreenCtx greenCtx1 = NULL;
+  CUgreenCtx greenCtx2 = NULL;
+  CUcontext cudaCtx1 = NULL;
+  CUcontext cudaCtx2 = NULL;
+
+  if (!PyArg_ParseTuple(args, "iI", &device_id, &num_sms_each))
+    return NULL;
+
+  CUDA_CHECK_AND_RETURN_NULL(cuDeviceGet(&device, device_id));
+  if (!ensureGreenCtxFunctionPointers())
+    goto cleanup;
+
+  // Get total SM resources
+  memset(&totalSmResource, 0, sizeof(totalSmResource));
+  CUDA_CHECK_AND_RETURN_NULL(cuDeviceGetDevResourceFn(
+      device, &totalSmResource, CU_DEV_RESOURCE_TYPE_SM));
+
+  // Split into 2 equal groups in a single call.
+  // result is a 2-element array; nbGroups=2 requests two partitions,
+  // each with at least num_sms_each SMs.  The driver assigns disjoint SM sets.
+  memset(splits, 0, sizeof(splits));
+  memset(&remaining, 0, sizeof(remaining));
+  CUDA_CHECK_AND_RETURN_NULL(cuDevSmResourceSplitByCountFn(
+      splits, &nbGroups, &totalSmResource, &remaining,
+      CU_DEV_SM_RESOURCE_SPLIT_IGNORE_SM_COSCHEDULING, num_sms_each));
+
+  if (nbGroups < 2) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "cuDevSmResourceSplitByCount could not create 2 groups "
+                    "-- not enough SMs on this device");
+    goto cleanup;
+  }
+
+  // Generate descriptors for each partition
+  CUDA_CHECK_AND_RETURN_NULL(
+      cuDevResourceGenerateDescFn(&resDesc1, &splits[0], 1));
+  CUDA_CHECK_AND_RETURN_NULL(
+      cuDevResourceGenerateDescFn(&resDesc2, &splits[1], 1));
+
+  // Create green contexts
+  CUDA_CHECK_AND_RETURN_NULL(cuGreenCtxCreateFn(
+      &greenCtx1, resDesc1, device, CU_GREEN_CTX_DEFAULT_STREAM));
+  CUDA_CHECK_AND_RETURN_NULL(cuGreenCtxCreateFn(
+      &greenCtx2, resDesc2, device, CU_GREEN_CTX_DEFAULT_STREAM));
+
+  // Get CUcontext handles
+  CUDA_CHECK_AND_RETURN_NULL(cuCtxFromGreenCtxFn(&cudaCtx1, greenCtx1));
+  CUDA_CHECK_AND_RETURN_NULL(cuCtxFromGreenCtxFn(&cudaCtx2, greenCtx2));
+
+  return Py_BuildValue("(KKKK)", (uint64_t)greenCtx1, (uint64_t)cudaCtx1,
+                       (uint64_t)greenCtx2, (uint64_t)cudaCtx2);
+
+cleanup:
+  // Staged rollback: destroy any successfully created contexts
+  if (greenCtx2)
+    cuGreenCtxDestroyFn(greenCtx2);
+  if (greenCtx1)
+    cuGreenCtxDestroyFn(greenCtx1);
+  return NULL;
+}
+
+// destroyGreenContext(green_ctx_handle)
+static PyObject *destroyGreenContext(PyObject *self, PyObject *args) {
+  uint64_t greenCtxHandle;
+  if (!PyArg_ParseTuple(args, "K", &greenCtxHandle))
+    return NULL;
+  if (!ensureGreenCtxFunctionPointers())
+    goto cleanup;
+
+  CUDA_CHECK_AND_RETURN_NULL(
+      cuGreenCtxDestroyFn((CUgreenCtx)greenCtxHandle));
+
+  Py_RETURN_NONE;
+
+cleanup:
+  return NULL;
+}
+
+// createGreenCtxStream(green_ctx_handle, flags, priority) -> stream_handle
+// NOTE: flags defaults to CU_STREAM_NON_BLOCKING (0x1) because green contexts
+// already own a default stream (created with CU_GREEN_CTX_DEFAULT_STREAM).
+// Using CU_STREAM_DEFAULT (0x0) would conflict and return CUDA_ERROR_INVALID_VALUE.
+static PyObject *createGreenCtxStream(PyObject *self, PyObject *args) {
+  uint64_t greenCtxHandle;
+  unsigned int flags = CU_STREAM_NON_BLOCKING;
+  int priority = 0;
+  if (!PyArg_ParseTuple(args, "K|Ii", &greenCtxHandle, &flags, &priority))
+    return NULL;
+  if (!ensureGreenCtxFunctionPointers())
+    goto cleanup;
+
+  CUstream stream;
+  Py_BEGIN_ALLOW_THREADS;
+  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuGreenCtxStreamCreateFn(
+      &stream, (CUgreenCtx)greenCtxHandle, flags, priority));
+  Py_END_ALLOW_THREADS;
+
+  return PyLong_FromUnsignedLongLong((uint64_t)stream);
+
+cleanup:
+  return NULL;
+}
+
+// destroyStream(stream_handle)
+static PyObject *destroyStream(PyObject *self, PyObject *args) {
+  uint64_t streamHandle;
+  if (!PyArg_ParseTuple(args, "K", &streamHandle))
+    return NULL;
+
+  if (streamHandle != 0) {
+    if (!ensureGreenCtxFunctionPointers())
+      goto cleanup;
+    Py_BEGIN_ALLOW_THREADS;
+    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(
+        cuStreamDestroyFn((CUstream)streamHandle));
+    Py_END_ALLOW_THREADS;
+  }
+
+  Py_RETURN_NONE;
+
+cleanup:
+  return NULL;
+}
+
+// getGreenCtxSmCount(green_ctx_handle) -> int
+static PyObject *getGreenCtxSmCount(PyObject *self, PyObject *args) {
+  uint64_t greenCtxHandle;
+  if (!PyArg_ParseTuple(args, "K", &greenCtxHandle))
+    return NULL;
+  if (!ensureGreenCtxFunctionPointers())
+    goto cleanup;
+
+  CUdevResource smResource;
+  memset(&smResource, 0, sizeof(smResource));
+  CUDA_CHECK_AND_RETURN_NULL(cuGreenCtxGetDevResourceFn(
+      (CUgreenCtx)greenCtxHandle, &smResource, CU_DEV_RESOURCE_TYPE_SM));
+
+  return PyLong_FromUnsignedLong(smResource.sm.smCount);
+
+cleanup:
+  return NULL;
+}
+
+// getDeviceSmCount(device_id) -> int (total SMs on device)
+static PyObject *getDeviceSmCount(PyObject *self, PyObject *args) {
+  int device_id;
+  if (!PyArg_ParseTuple(args, "i", &device_id))
+    return NULL;
+
+  CUdevice device;
+  CUDA_CHECK_AND_RETURN_NULL(cuDeviceGet(&device, device_id));
+  if (!ensureGreenCtxFunctionPointers())
+    goto cleanup;
+
+  CUdevResource smResource;
+  memset(&smResource, 0, sizeof(smResource));
+  CUDA_CHECK_AND_RETURN_NULL(cuDeviceGetDevResourceFn(
+      device, &smResource, CU_DEV_RESOURCE_TYPE_SM));
+
+  return PyLong_FromUnsignedLong(smResource.sm.smCount);
+
+cleanup:
+  return NULL;
+}
+
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided cubin into CUDA driver"},
@@ -1510,6 +1823,25 @@ static PyMethodDef ModuleMethods[] = {
      "will return metadata to be passed into 'launch' for quicker "
      "argument parsing."},
     {"launch", launchKernel, METH_VARARGS, "launches cuda kernel"},
+    // Green context APIs (CUDA 12.4+)
+    {"create_green_context", createGreenContext, METH_VARARGS,
+     "Create a green context with specified number of SMs. "
+     "Returns (green_ctx_handle, cuda_ctx_handle)."},
+    {"create_green_context_pair", createGreenContextPair, METH_VARARGS,
+     "Create two green contexts with non-overlapping equal SM partitions. "
+     "Args: (device_id, num_sms_each). "
+     "Returns (green_ctx1, cuda_ctx1, green_ctx2, cuda_ctx2)."},
+    {"destroy_green_context", destroyGreenContext, METH_VARARGS,
+     "Destroy a green context."},
+    {"create_green_ctx_stream", createGreenCtxStream, METH_VARARGS,
+     "Create a CUDA stream on a green context. "
+     "Returns stream handle."},
+    {"destroy_stream", destroyStream, METH_VARARGS,
+     "Destroy a CUDA stream created via create_green_ctx_stream."},
+    {"get_green_ctx_sm_count", getGreenCtxSmCount, METH_VARARGS,
+     "Get the number of SMs allocated to a green context."},
+    {"get_device_sm_count", getDeviceSmCount, METH_VARARGS,
+     "Get the total number of SMs on a device."},
 
     {NULL, NULL, 0, NULL} // sentinel
 };
